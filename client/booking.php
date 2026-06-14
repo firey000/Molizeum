@@ -6,14 +6,13 @@ if (!isset($_SESSION['user_role']) || $_SESSION['user_role'] !== 'client') {
 $uid = $_SESSION['user_id'];
 $msg = '';
 
-  // Автоматически завершаем просроченные бронирования
-  $conn->query("
-      UPDATE bookings b
-      LEFT JOIN equipment e ON b.equipment_id = e.id
-      SET b.status = 'finished', e.status = 'free'
-      WHERE b.status = 'active' AND b.end_time < NOW()
-  ");
-  
+// Автоматически завершаем просроченные бронирования
+$conn->query("
+    UPDATE bookings b
+    LEFT JOIN equipment e ON b.equipment_id = e.id
+    SET b.status = 'finished', e.status = 'free'
+    WHERE b.status = 'active' AND b.end_time < NOW()
+");
 
 // ── Отмена бронирования ──────────────────────────────────────
 if (isset($_GET['cancel']) && is_numeric($_GET['cancel'])) {
@@ -33,6 +32,78 @@ if (isset($_GET['cancel']) && is_numeric($_GET['cancel'])) {
         }
     }
     header("Location: booking.php"); exit;
+}
+
+// ── Продление бронирования (AJAX) ─────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'extend') {
+    header('Content-Type: application/json');
+    $bid   = (int)($_POST['booking_id']  ?? 0);
+    $extra = max(1, (int)($_POST['extra_hours'] ?? 1));
+
+    // Получаем бронирование и тариф
+    $b = $conn->query(
+        "SELECT b.equipment_id, b.service_id, b.end_time,
+                s.price AS tariff_price, s.name AS tariff_name,
+                e.number AS pc_number
+         FROM bookings b
+         JOIN services  s ON b.service_id   = s.id
+         JOIN equipment e ON b.equipment_id = e.id
+         WHERE b.id = $bid AND b.client_id = $uid AND b.status = 'active'
+         LIMIT 1"
+    )->fetch_assoc();
+
+    if (!$b) {
+        echo json_encode(['ok' => false, 'msg' => 'Бронирование не найдено или уже завершено']);
+        exit;
+    }
+
+    $price = (float)$b['tariff_price'];
+    $cost  = round($price * $extra, 2);
+    $bal   = (float)$conn->query("SELECT balance FROM users WHERE id=$uid")->fetch_assoc()['balance'];
+
+    if ($bal < $cost) {
+        echo json_encode([
+            'ok'  => false,
+            'msg' => 'Недостаточно средств. Баланс: ' . number_format($bal, 0, '.', ' ')
+                   . ' ₽, нужно: ' . number_format($cost, 0, '.', ' ') . ' ₽'
+        ]);
+        exit;
+    }
+
+    // Обновляем бронирование
+    $stmt = $conn->prepare(
+        "UPDATE bookings
+         SET end_time      = DATE_ADD(end_time, INTERVAL ? HOUR),
+             duration_hours = duration_hours + ?,
+             total_amount   = total_amount + ?
+         WHERE id = ?"
+    );
+    $stmt->bind_param("iidi", $extra, $extra, $cost, $bid);
+
+    // Списываем с баланса
+    $upd = $conn->prepare("UPDATE users SET balance = balance - ? WHERE id = ?");
+    $upd->bind_param("di", $cost, $uid);
+
+    // Записываем платёж
+    $neg_cost = -$cost;
+    $desc     = 'Продление сессии (ПК #' . $b['pc_number'] . ', +' . $extra
+              . ' ч, тариф: ' . $b['tariff_name'] . ')';
+    $pay = $conn->prepare(
+        "INSERT INTO payments (user_id, amount, type, description) VALUES (?, ?, 'booking', ?)"
+    );
+    $pay->bind_param("ids", $uid, $neg_cost, $desc);
+
+    if ($stmt->execute() && $upd->execute() && $pay->execute()) {
+        $new_bal = (float)$conn->query("SELECT balance FROM users WHERE id=$uid")->fetch_assoc()['balance'];
+        echo json_encode([
+            'ok'      => true,
+            'msg'     => 'Продлено на ' . $extra . ' ч. Списано ' . number_format($cost, 0, '.', ' ') . ' ₽',
+            'new_bal' => $new_bal
+        ]);
+    } else {
+        echo json_encode(['ok' => false, 'msg' => 'Ошибка БД: ' . htmlspecialchars($conn->error)]);
+    }
+    exit;
 }
 
 // ── Новое бронирование ───────────────────────────────────────
@@ -212,8 +283,12 @@ $p_res = $conn->query(
 );
 while ($p = $p_res->fetch_assoc()) $promos_js[] = $p;
 
+// ── Список бронирований клиента (с ценой тарифа для продления) ──
 $my_bookings = $conn->query("
-    SELECT b.*, CONCAT('ПК #', e.number) AS pc_label, s.name AS tariff_name
+    SELECT b.*,
+           CONCAT('ПК #', e.number) AS pc_label,
+           s.name  AS tariff_name,
+           s.price AS tariff_price
     FROM bookings b
     LEFT JOIN equipment e ON b.equipment_id = e.id
     LEFT JOIN services  s ON b.service_id   = s.id
@@ -338,11 +413,12 @@ $bal_now   = (float)$conn->query("SELECT balance FROM users WHERE id=$uid")->fet
         <?php
         $any = false;
         while ($b = $my_bookings->fetch_assoc()):
-            $any = true;
-            $sc  = $b['status'] === 'active'   ? 'badge-blue'
-                 : ($b['status'] === 'finished' ? 'badge-gray' : 'badge-red');
-            $st  = $b['status'] === 'active'   ? 'Активно'
-                 : ($b['status'] === 'finished' ? 'Завершено'  : 'Отменено');
+            $any  = true;
+            $sc   = $b['status'] === 'active'   ? 'badge-blue'
+                  : ($b['status'] === 'finished' ? 'badge-gray' : 'badge-red');
+            $st   = $b['status'] === 'active'   ? 'Активно'
+                  : ($b['status'] === 'finished' ? 'Завершено'  : 'Отменено');
+            $t_price = (float)($b['tariff_price'] ?? 0);
         ?>
         <li style="padding:14px 16px;border-bottom:1px solid var(--gray-100)">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
@@ -354,15 +430,30 @@ $bal_now   = (float)$conn->query("SELECT balance FROM users WHERE id=$uid")->fet
                 · <?= (int)$b['duration_hours'] ?> ч
                 · <?= number_format((float)$b['total_amount'], 0, '.', ' ') ?> ₽
             </div>
+            <?php if ($b['end_time']): ?>
+            <div style="font-size:12px;color:var(--gray-400);margin-bottom:4px">
+                До <?= date('d.m.Y H:i', strtotime($b['end_time'])) ?>
+            </div>
+            <?php endif; ?>
             <div style="font-size:12px;color:var(--gray-400);margin-bottom:8px">
                 <?= htmlspecialchars($b['tariff_name'] ?? '') ?>
             </div>
             <?php if ($b['status'] === 'active'): ?>
-            <a href="?cancel=<?= $b['id'] ?>"
-               class="action-btn btn-delete" style="font-size:12px"
-               onclick="return confirm('Отменить бронирование? Средства вернутся на баланс.')">
-               Отменить
-            </a>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button type="button"
+                        class="action-btn"
+                        style="font-size:12px;cursor:pointer;border:1px solid var(--blue);
+                               color:var(--blue);background:var(--blue-light);border-radius:var(--radius-xs);
+                               padding:4px 12px;font-family:inherit"
+                        onclick="openExtend(<?= $b['id'] ?>, <?= $t_price ?>, '<?= htmlspecialchars($b['pc_label'], ENT_QUOTES) ?>')">
+                    ⏱ Продлить
+                </button>
+                <a href="?cancel=<?= $b['id'] ?>"
+                   class="action-btn btn-delete" style="font-size:12px"
+                   onclick="return confirm('Отменить бронирование? Средства вернутся на баланс.')">
+                   Отменить
+                </a>
+            </div>
             <?php endif; ?>
         </li>
         <?php endwhile; ?>
@@ -372,6 +463,71 @@ $bal_now   = (float)$conn->query("SELECT balance FROM users WHERE id=$uid")->fet
         </ul>
     </div>
 
+</div>
+
+<!-- ══════════════ МОДАЛКА ПРОДЛЕНИЯ ══════════════ -->
+<div id="extend_modal"
+     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);
+            z-index:1000;align-items:center;justify-content:center;padding:16px">
+    <div style="background:#fff;border-radius:var(--radius);padding:28px 30px;
+                width:100%;max-width:360px;box-shadow:0 20px 60px rgba(0,0,0,.22)">
+
+        <!-- Заголовок -->
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <div style="font-size:16px;font-weight:700">⏱ Продление сессии</div>
+            <button onclick="closeExtend()"
+                    style="border:none;background:none;font-size:20px;cursor:pointer;
+                           color:var(--gray-400);line-height:1">✕</button>
+        </div>
+        <div id="ext_pc_label" style="font-size:13px;color:var(--gray-600);margin-bottom:20px"></div>
+
+        <!-- Поле часов -->
+        <div style="margin-bottom:14px">
+            <label style="font-size:12px;font-weight:600;color:var(--gray-600);
+                          text-transform:uppercase;letter-spacing:.04em;display:block;margin-bottom:6px">
+                Дополнительных часов
+            </label>
+            <input type="number" id="ext_hours" value="1" min="1" max="24"
+                   class="form-input" oninput="updateExtCalc()">
+        </div>
+
+        <!-- Расчёт стоимости -->
+        <div style="background:var(--gray-50);border-radius:var(--radius-sm);
+                    padding:12px 14px;margin-bottom:16px;font-size:13px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+                <span style="color:var(--gray-600)">Тариф:</span>
+                <span id="ext_tariff_str">— ₽/ч</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:5px;font-weight:700">
+                <span style="color:var(--gray-600)">К оплате:</span>
+                <strong id="ext_total_str">— ₽</strong>
+            </div>
+            <div style="display:flex;justify-content:space-between">
+                <span style="color:var(--gray-600)">Баланс после:</span>
+                <span id="ext_after_str" style="font-weight:600">— ₽</span>
+            </div>
+        </div>
+
+        <!-- Сообщение об ошибке / успехе -->
+        <div id="ext_msg" style="display:none;margin-bottom:12px;font-size:13px;
+             padding:10px 12px;border-radius:var(--radius-sm)"></div>
+
+        <!-- Кнопки -->
+        <div style="display:flex;gap:10px">
+            <button type="button" onclick="closeExtend()"
+                    style="flex:1;padding:10px;border:1px solid var(--gray-200);
+                           border-radius:var(--radius-sm);background:#fff;
+                           font-family:inherit;font-size:14px;cursor:pointer;color:var(--gray-600)">
+                Отмена
+            </button>
+            <button type="button" id="ext_submit" onclick="submitExtend()"
+                    style="flex:1;padding:10px;border:none;border-radius:var(--radius-sm);
+                           background:var(--blue);color:#fff;font-family:inherit;
+                           font-size:14px;font-weight:600;cursor:pointer">
+                Продлить и оплатить
+            </button>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -397,6 +553,7 @@ const PROMOS = <?= json_encode(array_map(function($p) {
     ];
 }, $promos_js)) ?>;
 
+// ── Расчёт тарифа для формы нового бронирования ──
 function updateTariff() {
     const pcSel  = document.getElementById('pc_select');
     const timeIn = document.getElementById('time_input').value;
@@ -430,7 +587,7 @@ function updateTariff() {
     const isNight = (hour >= 22 || hour < 7);
     const isVip   = hall.toLowerCase().includes('vip');
 
-    // Базовый тариф: VIP или Стандарт — ночь не меняет базу, только даёт скидку
+    // Базовый тариф
     let tariffName, tariffPrice;
     if (isVip) {
         tariffName  = 'VIP';
@@ -439,16 +596,15 @@ function updateTariff() {
         tariffName  = 'Стандарт';
         tariffPrice = TARIFFS['Стандарт'] || 100;
     }
-    const nightDiscount = isNight ? 20 : 0; // ночная скидка 20%
+    const nightDiscount = isNight ? 20 : 0;
 
     // Определяем акцию
     let discount = 0, promoName = '';
     const date   = new Date(dateIn);
-    const dow    = date.getDay(); // 0=Вс, 1=Пн..5=Пт, 6=Сб
+    const dow    = date.getDay();
     const isWeekday = (dow >= 1 && dow <= 5);
     const isHappy   = isWeekday && (hour >= 14 && hour < 17);
-
-    const isWeekend = (dow === 0 || dow === 6); // 0=Вс, 6=Сб
+    const isWeekend = (dow === 0 || dow === 6);
 
     for (const p of PROMOS) {
         let fits = false;
@@ -458,17 +614,10 @@ function updateTariff() {
             case 'happy_hours': fits = isHappy; break;
             case 'weekend':     fits = isWeekend; break;
         }
-        if (fits) {
-            discount  = p.discount;
-            promoName = p.name;
-            break; // первая подходящая с макс. скидкой
-        }
+        if (fits) { discount = p.discount; promoName = p.name; break; }
     }
 
-    // Суммируем скидки (акция + ночная), максимум 100%
     const combinedDiscount = Math.min(100, discount + nightDiscount);
-
-    // Цена
     const base    = tariffPrice * dur;
     const saved   = Math.round(base * combinedDiscount / 100);
     const total   = base - saved;
@@ -514,8 +663,98 @@ function updateTariff() {
     document.getElementById('calc_block').style.display = 'block';
 }
 
-// Инициализация при загрузке (если ПК уже выбран через ?pc=)
+// Инициализация при загрузке
 document.addEventListener('DOMContentLoaded', updateTariff);
+
+// ── Модалка продления ────────────────────────────────────────
+let extBookingId   = null;
+let extTariffPrice = 0;
+
+function openExtend(bookingId, tariffPrice, pcLabel) {
+    extBookingId   = bookingId;
+    extTariffPrice = tariffPrice;
+    document.getElementById('ext_pc_label').textContent = pcLabel;
+    document.getElementById('ext_hours').value          = 1;
+    document.getElementById('ext_msg').style.display    = 'none';
+    document.getElementById('ext_submit').disabled      = false;
+    document.getElementById('ext_submit').textContent   = 'Продлить и оплатить';
+    updateExtCalc();
+    document.getElementById('extend_modal').style.display = 'flex';
+}
+
+function closeExtend() {
+    document.getElementById('extend_modal').style.display = 'none';
+}
+
+function updateExtCalc() {
+    const hours   = parseInt(document.getElementById('ext_hours').value) || 1;
+    const total   = extTariffPrice * hours;
+    const after   = userBalance - total;
+
+    document.getElementById('ext_tariff_str').textContent = extTariffPrice.toLocaleString('ru') + ' ₽/ч';
+    document.getElementById('ext_total_str').textContent  = total.toLocaleString('ru') + ' ₽';
+
+    const afterEl = document.getElementById('ext_after_str');
+    afterEl.textContent  = after.toLocaleString('ru') + ' ₽';
+    afterEl.style.color  = after < 0 ? 'var(--red)' : 'var(--gray-800)';
+}
+
+function submitExtend() {
+    const hours  = parseInt(document.getElementById('ext_hours').value) || 1;
+    const btn    = document.getElementById('ext_submit');
+    const msgEl  = document.getElementById('ext_msg');
+
+    btn.disabled      = true;
+    btn.textContent   = 'Обработка...';
+    msgEl.style.display = 'none';
+
+    const fd = new FormData();
+    fd.append('action',      'extend');
+    fd.append('booking_id',  extBookingId);
+    fd.append('extra_hours', hours);
+
+    fetch('booking.php', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                msgEl.style.cssText =
+                    'display:block;background:#f0fdf4;color:#15803d;' +
+                    'border:1px solid #bbf7d0;padding:10px 12px;' +
+                    'border-radius:var(--radius-sm);margin-bottom:12px;font-size:13px';
+                msgEl.textContent = '✅ ' + data.msg;
+                // Обновляем баланс в шапке без перезагрузки
+                if (data.new_bal !== undefined) {
+                    const balEls = document.querySelectorAll('.panel-header-right [style*="font-weight:700"]');
+                    balEls.forEach(el => {
+                        el.textContent = Number(data.new_bal).toLocaleString('ru') + ' ₽';
+                    });
+                }
+                setTimeout(() => { closeExtend(); location.reload(); }, 1500);
+            } else {
+                msgEl.style.cssText =
+                    'display:block;background:var(--red-light);color:var(--red);' +
+                    'border:1px solid #fecdd3;padding:10px 12px;' +
+                    'border-radius:var(--radius-sm);margin-bottom:12px;font-size:13px';
+                msgEl.textContent = '⚠ ' + data.msg;
+                btn.disabled    = false;
+                btn.textContent = 'Продлить и оплатить';
+            }
+        })
+        .catch(() => {
+            msgEl.style.cssText =
+                'display:block;background:var(--red-light);color:var(--red);' +
+                'border:1px solid #fecdd3;padding:10px 12px;' +
+                'border-radius:var(--radius-sm);margin-bottom:12px;font-size:13px';
+            msgEl.textContent   = 'Ошибка соединения. Попробуйте ещё раз.';
+            btn.disabled        = false;
+            btn.textContent     = 'Продлить и оплатить';
+        });
+}
+
+// Закрытие по клику вне модального окна
+document.getElementById('extend_modal').addEventListener('click', function(e) {
+    if (e.target === this) closeExtend();
+});
 </script>
 
 </body>

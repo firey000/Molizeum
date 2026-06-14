@@ -122,6 +122,7 @@ include 'header.php';
                     <select class="form-select" name="method">
                         <option value="card">💳 Банковская карта</option>
                         <option value="sbp">📲 СБП</option>
+                        <option value="cash">💵 Наличные (у сотрудника)</option>
                     </select>
                 </div>
 
